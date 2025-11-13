@@ -1,36 +1,254 @@
+import math
+from pathlib import Path
+
 import nltk
 import torch
-from torch import nn
-from torch.utils.data import TensorDataset, DataLoader
+from matplotlib import pyplot as plt
+
+import config
+from torch import nn, optim
+from torch.utils.data import TensorDataset, DataLoader, random_split
+import torch.nn.functional as F
 
 nltk.download('punkt')
 nltk.download('punkt_tab')
 from nltk.tokenize import word_tokenize
 from datasets import load_dataset
 
+script_dir = Path(__file__).resolve().parent
 dataset = load_dataset("wikitext", "wikitext-2-raw-v1")
 unknown_token = "<UNK>"
 padding_token = "<PAD>"
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-token_sequence_length = 128
+loss_curve_path = script_dir / "loss_curve.png"
+model_path = script_dir / "model.pth"
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, embedding_dim, num_heads):
+        super(TransformerBlock, self).__init__()
+        head_dim = embedding_dim // num_heads
+        assert embedding_dim % num_heads == 0
+        self.head_dim = head_dim
+        self.num_heads = num_heads
+        self.W_q = nn.Linear(in_features=embedding_dim, out_features=embedding_dim)
+        self.W_k = nn.Linear(in_features=embedding_dim, out_features=embedding_dim)
+        self.W_v = nn.Linear(in_features=embedding_dim, out_features=embedding_dim)
+        self.W_o = nn.Linear(in_features=embedding_dim, out_features=embedding_dim)
+        self.attn_dropout = nn.Dropout(0.1)
+        self.norm1 = nn.LayerNorm(embedding_dim)
+        self.norm2 = nn.LayerNorm(embedding_dim)
+        out_features_first_ffn_step = 4 * embedding_dim
+        self.ffn = nn.Sequential(
+            nn.Linear(in_features=embedding_dim, out_features=out_features_first_ffn_step),
+            nn.ReLU(),
+            nn.Linear(in_features=out_features_first_ffn_step, out_features=embedding_dim)
+        )
+        self.ffn_dropout = nn.Dropout(0.1)
+
+    def forward(self, x):
+        # Key, query, value matrices - multi-head
+        Q = self.W_q(x)
+        K = self.W_k(x)
+        V = self.W_v(x)
+        Q = self._split_heads(Q)
+        K = self._split_heads(K)
+        V = self._split_heads(V)
+
+        # dot product attention, query - key
+        attention_scores = Q @ K.transpose(-2, -1)  # transpose K so we can perform matrix multiplication (inner dimensions have to be the same)
+        attention_scores = attention_scores / math.sqrt(self.head_dim)  # normalize so values dont explode
+
+        # causal mask - applied so model doesn't use future tokens to adjust behaviour
+        seq_len = x.size(1)
+        mask = torch.triu(torch.ones(seq_len, seq_len, device=x.device), diagonal=1).bool()
+        attention_scores = attention_scores.masked_fill(mask, float('-inf'))
+
+        # apply softmax to attention_scores to get a sort of probability distribution
+        softmax_attention_scores = F.softmax(attention_scores, dim=-1)
+
+        # calculate context using value matrix and softmax attention scores
+        context_vector = softmax_attention_scores @ V
+        context_vector = self._combine_heads(context_vector)
+        context_vector = self.W_o(context_vector)
+        context_vector = self.attn_dropout(context_vector)
+
+        # attention residual connection
+        x = self.norm1(x + context_vector)
+
+        # ffn
+        ffn_out = self.ffn(x)
+        ffn_out = self.ffn_dropout(ffn_out)
+
+        # residual connection
+        x = self.norm2(x + ffn_out)
+        return x
+
+    def _split_heads(self, tensor):
+        batch_size, seq_len, embed_dim = tensor.shape
+        # [batch, seq_len, num_heads, head_dim]
+        tensor = tensor.view(batch_size, seq_len, self.num_heads, self.head_dim)
+        # [batch, num_heads, seq_len, head_dim] for attention computation
+        return tensor.permute(0, 2, 1, 3)
+
+    def _combine_heads(self, tensor):
+        batch_size, num_heads, seq_len, head_dim = tensor.shape
+        # [batch, seq_len, num_heads, head_dim]
+        tensor = tensor.permute(0, 2, 1, 3)
+        # flatten last two dims: [batch, seq_len, embedding_dim]
+        return tensor.contiguous().view(batch_size, seq_len, num_heads * head_dim)
 
 
 class Transformer(nn.Module):
-    def __init__(self, num_embeddings, embedding_dim):
+    def __init__(self, vocab_size, embedding_dim, num_heads, num_blocks):
         super(Transformer, self).__init__()
-        self.embedding = nn.Embedding(num_embeddings=num_embeddings, embedding_dim=embedding_dim)
-        self.pos_embedding = nn.Embedding(num_embeddings=token_sequence_length, embedding_dim=embedding_dim)
+        self.vocab_size = vocab_size
+        self.embedding = nn.Embedding(num_embeddings=vocab_size, embedding_dim=embedding_dim)
+        self.embedding_dropout = nn.Dropout(0.1)
+        self.pos_embedding = nn.Embedding(num_embeddings=config.TOKEN_SEQUENCE_LENGTH, embedding_dim=embedding_dim)
+        self.blocks = nn.ModuleList([TransformerBlock(embedding_dim, num_heads) for _ in range(num_blocks)])
+        self.output_layer = nn.Linear(in_features=embedding_dim, out_features=vocab_size)
+        self.patience = 5
 
     def forward(self, x):
+        # Embeddings
         x = self.embedding(x)
-        positions = torch.arange(token_sequence_length).unsqueeze(0).to(device)
+        x = self.embedding_dropout(x)
+        positions = torch.arange(x.size(1), device=x.device).unsqueeze(0)
         x = x + self.pos_embedding(positions)
 
+        for block in self.blocks:
+            x = block(x)
+
+        return self.output_layer(x)
+
+    def fit(self, train_loader, val_loader, epochs):
+        optimizer = optim.AdamW(self.parameters(), lr=config.LEARNING_RATE, weight_decay=0.01)
+        loss_fn = nn.CrossEntropyLoss()
+        scaler = torch.amp.GradScaler(device='cuda')
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.EPOCHS)
+
+        start_epoch = 0
+        trigger_times = 0
+        best_val_loss = float('inf')
+
+        # try to load checkpoint if exists
+        if model_path.exists():
+            try:
+                ckpt = torch.load(model_path, map_location=config.DEVICE)
+                if 'model_state_dict' in ckpt:
+                    self.load_state_dict(ckpt['model_state_dict'])
+                    print("Loaded model_state_dict from checkpoint.")
+                if 'optimizer_state_dict' in ckpt:
+                    try:
+                        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+                        print("Loaded optimizer_state_dict from checkpoint.")
+                    except Exception as e:
+                        print("Warning: failed to load optimizer state:", e)
+                if 'scaler_state_dict' in ckpt and ckpt['scaler_state_dict'] is not None:
+                    try:
+                        scaler.load_state_dict(ckpt['scaler_state_dict'])
+                        print("Loaded scaler_state_dict from checkpoint.")
+                    except Exception as e:
+                        print("Warning: failed to load scaler state:", e)
+                if 'best_val_loss' in ckpt:
+                    best_val_loss = ckpt['best_val_loss']
+                if 'epoch' in ckpt:
+                    start_epoch = ckpt['epoch'] + 1
+                    print(f"Resuming training from epoch {start_epoch}")
+            except Exception as e:
+                print("Warning: failed to load checkpoint, starting from scratch. Error:", e)
+
+
+        train_losses, val_losses = [], []
+        for epoch in range(start_epoch, epochs):
+            epoch_loss = 0.0
+            self.train()
+            for batch_X, batch_y in train_loader:
+                optimizer.zero_grad()
+                batch_X, batch_y = batch_X.to(config.DEVICE), batch_y.to(config.DEVICE)
+                with torch.cuda.amp.autocast():
+                    logits = self(batch_X)
+                    logits = logits.view(-1, self.vocab_size)  # [B*L, vocab_size]
+                    batch_y = batch_y.view(-1)  # [B*L]
+                    loss = loss_fn(logits, batch_y)
+
+                scaler.scale(loss).backward()
+                torch.nn.utils.clip_grad_norm_(self.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+
+                epoch_loss += loss.item() * batch_X.size(0)
+
+            avg_train_loss = epoch_loss / len(train_loader.dataset)
+            train_losses.append(avg_train_loss)
+
+            #validation
+            val_loss = self._compute_validation_loss(val_loader, loss_fn)
+            val_losses.append(val_loss)
+            if val_loss < best_val_loss:
+                trigger_times = 0
+                best_val_loss = val_loss
+                checkpoint = {
+                    'epoch': epoch,
+                    'model_state_dict': self.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scaler_state_dict': scaler.state_dict(),
+                    'best_val_loss': best_val_loss
+                }
+                torch.save(checkpoint, model_path)
+                print(f"Saved checkpoint with val loss {best_val_loss:.4f} at epoch {epoch}")
+            else:
+                trigger_times += 1
+                print(f"No improvement in val loss for {trigger_times} epochs.")
+                if trigger_times >= self.patience:
+                    print(f"Early stopping at epoch {epoch}")
+                    break
+
+            print(f"Epoch {epoch}, Train loss: {avg_train_loss: .4f}, Val loss: {val_loss: .4f}")
+            scheduler.step()
+
+        # load the best checkpoint if exists
+        if model_path.exists():
+            ckpt = torch.load(model_path, map_location=config.DEVICE)
+            self.load_state_dict(ckpt['model_state_dict'])
+            print(f"Loaded best model from checkpoint saved at epoch {ckpt.get('epoch', 'unknown')} with val loss {ckpt.get('best_val_loss', 'unknown')}")
+        _plot_loss_curve(train_losses, val_losses)
+
+    def _compute_validation_loss(self, val_loader, loss_fn):
+        total_loss = 0.0
+        self.eval()
+        with torch.no_grad():
+            for batch_X, batch_y in val_loader:
+                batch_X, batch_y = batch_X.to(config.DEVICE), batch_y.to(config.DEVICE)
+                with torch.cuda.amp.autocast():
+                    logits = self(batch_X)
+                    logits = logits.view(-1, self.vocab_size)  # [B*L, vocab_size]
+                    batch_y = batch_y.view(-1)  # [B*L]
+                    loss = loss_fn(logits, batch_y)
+                total_loss += loss.item() * batch_X.size(0)
+
+        total_loss = total_loss / len(val_loader.dataset)
+        return total_loss
+
+def _plot_loss_curve(train_loss, val_loss):
+    plt.figure(figsize=(8, 5))
+    plt.plot(train_loss, label="train")
+    plt.plot(val_loss, label="val")
+    plt.title("Loss Curve")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(loss_curve_path)
+    plt.close()
+    print(f"Saved loss curve to {loss_curve_path}")
 
 def _load_training_data_tokenized():
     train_data_test = dataset["train"]['text']
     train_text = "\n".join(train_data_test)  # converts list of strings into a newline separated string
     return word_tokenize(train_text)
+
 
 def _create_vocabulary(tokenized_training_data):
     vocab = {padding_token: 0, unknown_token: 1}
@@ -42,6 +260,7 @@ def _create_vocabulary(tokenized_training_data):
 
     return vocab
 
+
 def _encode_text(tokenized_training_data, vocab):
     encoded_text = []
     for token in tokenized_training_data:
@@ -52,7 +271,8 @@ def _encode_text(tokenized_training_data, vocab):
 
     return encoded_text
 
-def _prepare_training_data(encoded_text, batch_size=64):
+
+def _prepare_training_data(encoded_text, batch_size, token_sequence_length):
     x = []
     y = []
     for i in range(0, len(encoded_text), token_sequence_length):
@@ -65,13 +285,28 @@ def _prepare_training_data(encoded_text, batch_size=64):
     tensor_y = torch.tensor(y, dtype=torch.long)
 
     tensor_dataset = TensorDataset(tensor_x, tensor_y)
-    data_loader = DataLoader(tensor_dataset, batch_size=batch_size, shuffle=True)
-    return data_loader
+    train_size = int(0.8 * len(tensor_dataset))
+    val_size = len(tensor_dataset) - train_size
+    train_dataset, val_dataset = random_split(tensor_dataset, [train_size, val_size])
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, pin_memory=True)
+    return train_loader, val_loader
+
 
 def main():
     tokenized_training_data = _load_training_data_tokenized()
     vocab = _create_vocabulary(tokenized_training_data)
     encoded_text = _encode_text(tokenized_training_data, vocab)
+    train_loader, val_loader = _prepare_training_data(encoded_text=encoded_text, batch_size=config.BATCH_SIZE, token_sequence_length=config.TOKEN_SEQUENCE_LENGTH)
+
+    model = Transformer(
+        vocab_size=len(vocab),
+        embedding_dim=128,
+        num_heads=config.NUM_HEADS,
+        num_blocks=config.NUM_BLOCKS
+    ).to(config.DEVICE)
+    model.fit(train_loader, val_loader, epochs=config.EPOCHS)
+
 
 if __name__ == '__main__':
     main()

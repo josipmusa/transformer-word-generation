@@ -1,8 +1,11 @@
 import math
+import os
+import time
 from pathlib import Path
 
 import nltk
 import torch
+import sentencepiece as spm
 from matplotlib import pyplot as plt
 
 import config
@@ -106,7 +109,8 @@ class Transformer(nn.Module):
         self.embedding_dropout = nn.Dropout(0.1)
         self.pos_embedding = nn.Embedding(num_embeddings=config.TOKEN_SEQUENCE_LENGTH, embedding_dim=embedding_dim)
         self.blocks = nn.ModuleList([TransformerBlock(embedding_dim, num_heads) for _ in range(num_blocks)])
-        self.output_layer = nn.Linear(in_features=embedding_dim, out_features=vocab_size)
+        self.output_layer = nn.Linear(in_features=embedding_dim, out_features=vocab_size, bias=False)
+        self.output_layer.weight = self.embedding.weight #tie weights from embedding matrix to output matrix - improves compute time
         self.patience = 5
 
     def forward(self, x):
@@ -121,63 +125,75 @@ class Transformer(nn.Module):
 
         return self.output_layer(x)
 
+
     def fit(self, train_loader, val_loader, epochs):
+        start_time = time.time()
         optimizer = optim.AdamW(self.parameters(), lr=config.LEARNING_RATE, weight_decay=0.01)
         loss_fn = nn.CrossEntropyLoss()
         scaler = torch.amp.GradScaler(device='cuda')
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.EPOCHS)
 
-        start_epoch = 0
+        # Warmup + cosine decay scheduler
+        total_steps = epochs * len(train_loader)
+        warmup_steps = int(0.05 * total_steps) # 5% warmup
+
+        def lr_lambda(step):
+            if step < warmup_steps:
+                return float(step) / float(max(1, warmup_steps))
+            # cosine decay
+            progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
         trigger_times = 0
         best_val_loss = float('inf')
-
-        # try to load checkpoint if exists
-        if model_path.exists():
-            try:
-                ckpt = torch.load(model_path, map_location=config.DEVICE)
-                if 'model_state_dict' in ckpt:
-                    self.load_state_dict(ckpt['model_state_dict'])
-                    print("Loaded model_state_dict from checkpoint.")
-                if 'optimizer_state_dict' in ckpt:
-                    try:
-                        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-                        print("Loaded optimizer_state_dict from checkpoint.")
-                    except Exception as e:
-                        print("Warning: failed to load optimizer state:", e)
-                if 'scaler_state_dict' in ckpt and ckpt['scaler_state_dict'] is not None:
-                    try:
-                        scaler.load_state_dict(ckpt['scaler_state_dict'])
-                        print("Loaded scaler_state_dict from checkpoint.")
-                    except Exception as e:
-                        print("Warning: failed to load scaler state:", e)
-                if 'best_val_loss' in ckpt:
-                    best_val_loss = ckpt['best_val_loss']
-                if 'epoch' in ckpt:
-                    start_epoch = ckpt['epoch'] + 1
-                    print(f"Resuming training from epoch {start_epoch}")
-            except Exception as e:
-                print("Warning: failed to load checkpoint, starting from scratch. Error:", e)
-
+        global_step = 0
 
         train_losses, val_losses = [], []
-        for epoch in range(start_epoch, epochs):
+        for epoch in range(epochs):
             epoch_loss = 0.0
             self.train()
-            for batch_X, batch_y in train_loader:
-                optimizer.zero_grad()
-                batch_X, batch_y = batch_X.to(config.DEVICE), batch_y.to(config.DEVICE)
-                with torch.cuda.amp.autocast():
-                    logits = self(batch_X)
-                    logits = logits.view(-1, self.vocab_size)  # [B*L, vocab_size]
-                    batch_y = batch_y.view(-1)  # [B*L]
-                    loss = loss_fn(logits, batch_y)
+            optimizer.zero_grad()
 
+            for step, batch in enumerate(train_loader):
+                x, y = batch
+                x, y = x.to(config.DEVICE), y.to(config.DEVICE)
+
+                #Compute unscaled loss for logging
+                with torch.cuda.amp.autocast():
+                    logits = self(x)
+                    logits = logits.view(-1, self.vocab_size)  # [B*L, vocab_size]
+                    y = y.view(-1)  # [B*L]
+                    raw_loss = loss_fn(logits, y)
+
+                # scale for accumulation, then call backward
+                loss = raw_loss / config.GRAD_ACCUM_STEPS
                 scaler.scale(loss).backward()
+
+                # optimizer step only every grad_accum steps
+                if (step + 1) % config.GRAD_ACCUM_STEPS == 0:
+                    # clip grads on the *unscaled* gradients (done after scaler.unscale_ below)
+                    scaler.unscale_(optimizer)  # bring grads into fp32 for clipping
+                    torch.nn.utils.clip_grad_norm_(self.parameters(), 1.0)
+
+                    scaler.step(optimizer)
+                    scaler.update()
+                    scheduler.step()
+                    optimizer.zero_grad()
+                    global_step += 1
+
+                epoch_loss += raw_loss.item() * x.size(0)
+
+            # handle leftover gradients at epoch end (if dataset size is not divisible by grad_accum steps)
+            if (step + 1) % config.GRAD_ACCUM_STEPS != 0:
+                # there are remaining grads that weren't stepped yet
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(self.parameters(), 1.0)
                 scaler.step(optimizer)
                 scaler.update()
-
-                epoch_loss += loss.item() * batch_X.size(0)
+                scheduler.step()
+                optimizer.zero_grad()
+                global_step += 1
 
             avg_train_loss = epoch_loss / len(train_loader.dataset)
             train_losses.append(avg_train_loss)
@@ -205,7 +221,6 @@ class Transformer(nn.Module):
                     break
 
             print(f"Epoch {epoch}, Train loss: {avg_train_loss: .4f}, Val loss: {val_loss: .4f}")
-            scheduler.step()
 
         # load the best checkpoint if exists
         if model_path.exists():
@@ -213,6 +228,8 @@ class Transformer(nn.Module):
             self.load_state_dict(ckpt['model_state_dict'])
             print(f"Loaded best model from checkpoint saved at epoch {ckpt.get('epoch', 'unknown')} with val loss {ckpt.get('best_val_loss', 'unknown')}")
         _plot_loss_curve(train_losses, val_losses)
+        end_time = time.time()
+        print(f"Model trained in {end_time - start_time:.4f} seconds")
 
     def _compute_validation_loss(self, val_loader, loss_fn):
         total_loss = 0.0
@@ -244,42 +261,12 @@ def _plot_loss_curve(train_loss, val_loss):
     plt.close()
     print(f"Saved loss curve to {loss_curve_path}")
 
-def _load_training_data_tokenized():
-    train_data_test = dataset["train"]['text']
-    train_text = "\n".join(train_data_test)  # converts list of strings into a newline separated string
-    return word_tokenize(train_text)
 
-
-def _create_vocabulary(tokenized_training_data):
-    vocab = {padding_token: 0, unknown_token: 1}
-    next_index = 2
-    for token in tokenized_training_data:
-        if token not in vocab:
-            vocab[token] = next_index
-            next_index += 1
-
-    return vocab
-
-
-def _encode_text(tokenized_training_data, vocab):
-    encoded_text = []
-    for token in tokenized_training_data:
-        if token not in vocab:
-            encoded_text.append(vocab.get(unknown_token))
-        else:
-            encoded_text.append(vocab.get(token))
-
-    return encoded_text
-
-
-def _prepare_training_data(encoded_text, batch_size, token_sequence_length):
-    x = []
-    y = []
-    for i in range(0, len(encoded_text), token_sequence_length):
-        if len(encoded_text) - i < token_sequence_length:
-            break
-        x.append(encoded_text[i: i + token_sequence_length])
-        y.append(encoded_text[i + 1: i + token_sequence_length + 1])
+def _prepare_training_data(encoded_ids, batch_size, token_sequence_length):
+    x, y = [], []
+    for i in range(0, len(encoded_ids) - token_sequence_length, token_sequence_length):
+        x.append(encoded_ids[i: i + token_sequence_length])
+        y.append(encoded_ids[i + 1: i + token_sequence_length + 1])
 
     tensor_x = torch.tensor(x, dtype=torch.long)
     tensor_y = torch.tensor(y, dtype=torch.long)
@@ -292,19 +279,69 @@ def _prepare_training_data(encoded_text, batch_size, token_sequence_length):
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, pin_memory=True)
     return train_loader, val_loader
 
+def _train_sentencepiece(input_texts, model_prefix="spm", vocab_size=16000, model_type="bpe"):
+    tmp_path = script_dir / f"{model_prefix}_train.txt"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        for line in input_texts:
+            # write raw lines; you can also join paragraphs etc.
+            f.write(line.replace("\n", " ") + "\n")
+
+    spm.SentencePieceTrainer.train(
+        input=str(tmp_path),
+        model_prefix=str(script_dir / model_prefix),
+        vocab_size=vocab_size,
+        model_type=model_type,
+        character_coverage=1.0,
+        pad_id=0,
+        unk_id=1,
+        bos_id=2,
+        eos_id=3,
+        user_defined_symbols=""  # you can add tokens like "<mask>"
+    )
+
+    os.remove(tmp_path)
+    return (script_dir / f"{model_prefix}.model"), (script_dir / f"{model_prefix}.vocab")
+
+def _load_spm(spm_model_path):
+    sp = spm.SentencePieceProcessor()
+    sp.load(str(spm_model_path))
+    return sp
+
+def _encode_corpus_to_ids(sp, texts):
+    ids = []
+    for txt in texts:
+        if not txt:
+            continue
+        # encode as ints
+        piece_ids = sp.encode(txt, out_type=int)
+        ids.extend(piece_ids)
+    return ids
+
 
 def main():
-    tokenized_training_data = _load_training_data_tokenized()
-    vocab = _create_vocabulary(tokenized_training_data)
-    encoded_text = _encode_text(tokenized_training_data, vocab)
-    train_loader, val_loader = _prepare_training_data(encoded_text=encoded_text, batch_size=config.BATCH_SIZE, token_sequence_length=config.TOKEN_SEQUENCE_LENGTH)
+    raw_texts = dataset["train"]['text']
+
+    # if tokenizer model exists, load it, otherwise train
+    spm_model = script_dir / "spm.model"
+    if not spm_model.exists():
+        print("Training SentencePiece tokenizer (this may take a while)...")
+        _train_sentencepiece(raw_texts, vocab_size=16000)
+
+    sp = _load_spm(spm_model)
+    vocab_size = sp.vocab_size()
+
+    # encode dataset into integers
+    ids = _encode_corpus_to_ids(sp, raw_texts)
+
+    train_loader, val_loader = _prepare_training_data(encoded_ids=ids, batch_size=config.BATCH_SIZE, token_sequence_length=config.TOKEN_SEQUENCE_LENGTH)
 
     model = Transformer(
-        vocab_size=len(vocab),
-        embedding_dim=128,
+        vocab_size=vocab_size,
+        embedding_dim=config.EMBEDDING_DIM,
         num_heads=config.NUM_HEADS,
         num_blocks=config.NUM_BLOCKS
     ).to(config.DEVICE)
+
     model.fit(train_loader, val_loader, epochs=config.EPOCHS)
 
 

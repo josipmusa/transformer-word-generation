@@ -1,6 +1,8 @@
 import os
 from pathlib import Path
 import argparse
+
+import nltk
 import torch
 import sentencepiece as spm
 from datasets import load_dataset
@@ -9,6 +11,8 @@ from torch.utils.data import DataLoader, random_split, TensorDataset
 import config
 from transformer import Transformer
 
+nltk.download('punkt')
+nltk.download('punkt_tab')
 script_dir = Path(__file__).resolve().parent
 dataset = load_dataset("wikitext", "wikitext-2-raw-v1")
 

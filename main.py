@@ -3,7 +3,6 @@ import os
 import time
 from pathlib import Path
 
-import nltk
 import torch
 import sentencepiece as spm
 from matplotlib import pyplot as plt
@@ -12,9 +11,6 @@ import config
 from torch import nn, optim
 from torch.utils.data import TensorDataset, DataLoader, random_split
 import torch.nn.functional as F
-
-nltk.download('punkt')
-nltk.download('punkt_tab')
 from datasets import load_dataset
 
 script_dir = Path(__file__).resolve().parent

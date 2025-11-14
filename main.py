@@ -15,13 +15,10 @@ import torch.nn.functional as F
 
 nltk.download('punkt')
 nltk.download('punkt_tab')
-from nltk.tokenize import word_tokenize
 from datasets import load_dataset
 
 script_dir = Path(__file__).resolve().parent
 dataset = load_dataset("wikitext", "wikitext-2-raw-v1")
-unknown_token = "<UNK>"
-padding_token = "<PAD>"
 loss_curve_path = script_dir / "loss_curve.png"
 model_path = script_dir / "model.pth"
 
@@ -125,6 +122,30 @@ class Transformer(nn.Module):
 
         return self.output_layer(x)
 
+    def generate(self, sp, prompt, num_steps, temperature=0.8, top_k=50):
+        self.eval()
+        input_tokens = sp.encode(prompt, out_type=int)
+        input_tensor = torch.tensor([input_tokens], device=config.DEVICE)
+        for i in range(num_steps):
+            with torch.no_grad():
+                logits = self(input_tensor) #shape is [batch_size, seq_len, vocab_size] - we need last vector from seq_len
+                logits_last = logits[:, -1, :] # shape is [1, vocab_size]
+
+                # apply temperature
+                logits_last = logits_last / temperature
+
+                # top-k filtering
+                if top_k is not None:
+                    topk_vals, topk_indices = torch.topk(logits_last, top_k, dim=-1)
+                    probs = torch.zeros_like(logits_last).scatter_(-1, topk_indices, F.softmax(topk_vals, dim=-1))
+                else:
+                    probs = F.softmax(logits_last, dim=-1)
+
+                next_token = torch.multinomial(probs, num_samples=1)
+                input_tensor = torch.cat([input_tensor, next_token], dim=1)
+
+        output_tokens = input_tensor[0].tolist()
+        return sp.decode(output_tokens)
 
     def fit(self, train_loader, val_loader, epochs):
         start_time = time.time()
@@ -274,7 +295,9 @@ def _prepare_training_data(encoded_ids, batch_size, token_sequence_length):
     tensor_dataset = TensorDataset(tensor_x, tensor_y)
     train_size = int(0.8 * len(tensor_dataset))
     val_size = len(tensor_dataset) - train_size
+
     train_dataset, val_dataset = random_split(tensor_dataset, [train_size, val_size])
+
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, pin_memory=True)
     return train_loader, val_loader
@@ -317,7 +340,6 @@ def _encode_corpus_to_ids(sp, texts):
         ids.extend(piece_ids)
     return ids
 
-
 def main():
     raw_texts = dataset["train"]['text']
 
@@ -330,11 +352,6 @@ def main():
     sp = _load_spm(spm_model)
     vocab_size = sp.vocab_size()
 
-    # encode dataset into integers
-    ids = _encode_corpus_to_ids(sp, raw_texts)
-
-    train_loader, val_loader = _prepare_training_data(encoded_ids=ids, batch_size=config.BATCH_SIZE, token_sequence_length=config.TOKEN_SEQUENCE_LENGTH)
-
     model = Transformer(
         vocab_size=vocab_size,
         embedding_dim=config.EMBEDDING_DIM,
@@ -342,8 +359,20 @@ def main():
         num_blocks=config.NUM_BLOCKS
     ).to(config.DEVICE)
 
-    model.fit(train_loader, val_loader, epochs=config.EPOCHS)
+    if model_path.exists():
+        ckpt = torch.load(model_path, map_location=config.DEVICE)
+        model.load_state_dict(ckpt['model_state_dict'])
+        print(f"Loaded best model from checkpoint saved at epoch {ckpt.get('epoch', 'unknown')} with val loss {ckpt.get('best_val_loss', 'unknown')}")
+    else:
+        # encode dataset into integers
+        ids = _encode_corpus_to_ids(sp, raw_texts)
+        train_loader, val_loader = _prepare_training_data(encoded_ids=ids, batch_size=config.BATCH_SIZE,
+                                                          token_sequence_length=config.TOKEN_SEQUENCE_LENGTH)
+        model.fit(train_loader, val_loader, epochs=config.EPOCHS)
 
+    prompt = "The game has been described"
+    output = model.generate(sp, prompt, 10)
+    print(output)
 
 if __name__ == '__main__':
     main()
